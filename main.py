@@ -1,374 +1,361 @@
 import io
-import json
 import os
 import re
+import json
 from copy import deepcopy
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import StreamingResponse
+
 from docx import Document
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
-
-app = FastAPI()
-
-PLACEHOLDER = "{{CONTENT}}"
+from docx.table import Table
 
 
-# -------------------------
-# Utilities: docx traversal
-# -------------------------
+app = FastAPI(title="docx-format-api", version="0.1.0")
 
-def iter_paragraphs_in_cell(cell) -> Iterable[Paragraph]:
-    for p in cell.paragraphs:
-        yield p
-    for t in cell.tables:
-        for row in t.rows:
-            for c in row.cells:
-                yield from iter_paragraphs_in_cell(c)
-
-def iter_all_paragraphs(doc: Document) -> Iterable[Paragraph]:
-    # Top-level paragraphs
-    for p in doc.paragraphs:
-        yield p
-    # Paragraphs inside tables
-    for t in doc.tables:
-        for row in t.rows:
-            for cell in row.cells:
-                yield from iter_paragraphs_in_cell(cell)
+# 可选：简单鉴权。Render/Railway 配环境变量 API_KEY，然后 Dify HTTP 节点 Header 传 X-API-Key
+API_KEY = os.getenv("API_KEY", "").strip() or None
 
 
-# -------------------------
-# Utilities: styles
-# -------------------------
-
-def list_style_ids(doc: Document) -> Dict[str, str]:
-    """Return mapping style_name -> style_id for styles in doc."""
-    out = {}
-    for s in doc.styles:
-        try:
-            # Some styles may not have name/id accessible cleanly
-            if getattr(s, "name", None) and getattr(s, "style_id", None):
-                out[s.name] = s.style_id
-        except Exception:
-            continue
-    return out
-
-def pick_style_id(template_doc: Document, candidates: List[str]) -> Optional[str]:
-    """Pick first existing style_id in template by name candidates."""
-    style_map = list_style_ids(template_doc)
-    for name in candidates:
-        if name in style_map:
-            return style_map[name]
-    return None
-
-def set_paragraph_style_id(p: Paragraph, style_id: str) -> None:
-    """Set paragraph's w:pStyle to style_id (no need style exist in source doc)."""
-    if not style_id:
-        return
-    p_elm = p._p
-    pPr = p_elm.get_or_add_pPr()
-    pStyle = pPr.find(qn("w:pStyle"))
-    if pStyle is None:
-        pStyle = OxmlElement("w:pStyle")
-        pPr.insert(0, pStyle)
-    pStyle.set(qn("w:val"), style_id)
+# -----------------------------
+# Helpers: blocks iteration
+# -----------------------------
+def iter_block_items(doc: Document):
+    """Yield Paragraph and Table items in document order."""
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag.endswith("}p"):
+            yield Paragraph(child, doc)
+        elif child.tag.endswith("}tbl"):
+            yield Table(child, doc)
 
 
-# -------------------------
-# Rules parsing & matching
-# -------------------------
+def clear_document_body(doc: Document) -> None:
+    """Remove all body content except section properties (sectPr)."""
+    body = doc.element.body
+    sectPr = body.sectPr
+    # Remove everything
+    for child in list(body):
+        body.remove(child)
+    # Re-add sectPr if present
+    if sectPr is not None:
+        body.append(sectPr)
 
-def _compile_detect(detect: str):
+
+def get_style_names(doc: Document) -> set:
+    names = set()
+    try:
+        for s in doc.styles:
+            # s.name is localized name in many templates (e.g., "标题 1"/"正文")
+            if getattr(s, "name", None):
+                names.add(s.name)
+    except Exception:
+        pass
+    return names
+
+
+def pick_existing_style(preferred: Optional[str], template_styles: set, fallbacks: List[str]) -> str:
+    if preferred and preferred in template_styles:
+        return preferred
+    for fb in fallbacks:
+        if fb in template_styles:
+            return fb
+    return "Normal"
+
+
+# -----------------------------
+# Rules parsing (方案 A)
+# -----------------------------
+def parse_rules(raw: Optional[str]) -> Optional[Dict[str, Any]]:
     """
-    detect supports:
-    - "regex:<pattern>"  -> regex search
-    - otherwise          -> contains match (supports "|" as OR)
+    Accepts:
+      - None/"" -> None
+      - A JSON object string -> dict
+      - A JSON string that itself contains JSON (your current LLM output) -> dict (double loads)
+      - A wrapper object like {"text": "..."} -> unwrap then parse
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+
+    # Sometimes callers accidentally pass the whole LLM node output object as JSON
+    # e.g. {"text":"{...}", "usage":...}
+    try:
+        maybe_wrapper = json.loads(raw)
+        if isinstance(maybe_wrapper, dict) and "text" in maybe_wrapper and isinstance(maybe_wrapper["text"], str):
+            raw = maybe_wrapper["text"].strip()
+    except Exception:
+        pass
+
+    # First parse attempt
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        # Fallback: extract first {...} block
+        l = raw.find("{")
+        r = raw.rfind("}")
+        if l != -1 and r != -1 and r > l:
+            obj = json.loads(raw[l:r + 1])
+        else:
+            raise
+
+    # If first load gives a string (your case), load again
+    if isinstance(obj, str):
+        obj = json.loads(obj)
+
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+# -----------------------------
+# Compile detection rules
+# -----------------------------
+def compile_detect(detect: str) -> Tuple[str, Any]:
+    """
+    detect formats:
+      - "regex:<pattern>"
+      - "contains:a|b|c"
+    Returns (kind, compiled)
     """
     detect = (detect or "").strip()
-    if not detect:
-        return None
-
     if detect.lower().startswith("regex:"):
         pat = detect[6:].strip()
-        try:
-            rx = re.compile(pat)
-            return ("regex", rx)
-        except re.error:
-            return None
-    else:
-        keys = [k.strip() for k in detect.split("|") if k.strip()]
-        if not keys:
-            return None
+        return ("regex", re.compile(pat))
+    if detect.lower().startswith("contains:"):
+        keys = [k.strip() for k in detect[9:].split("|") if k.strip()]
         return ("contains", keys)
+    # fallback: treat as contains single keyword
+    return ("contains", [detect])
 
-def _match(compiled, text: str) -> bool:
-    if compiled is None:
-        return False
+
+def match_detect(compiled: Tuple[str, Any], text: str) -> bool:
     kind, obj = compiled
     if kind == "regex":
-        return obj.search(text) is not None
-    return any(k in text for k in obj)
+        return bool(obj.search(text))
+    # contains
+    t = text or ""
+    return any(k in t for k in obj)
 
-def normalize_rules(rules_obj: dict) -> dict:
-    """
-    Accept multiple shapes:
-    1) {"formatting_intent": {"heading_rules":[{level, detect, style_name|style_key}], "body_style_name":...}}
-    2) {"rules": {...}}  (your own future schema)
-    """
-    if not isinstance(rules_obj, dict):
-        return {}
 
-    if "formatting_intent" in rules_obj and isinstance(rules_obj["formatting_intent"], dict):
-        return rules_obj
-
-    # You can extend here if you later change LLM output format.
-    if "rules" in rules_obj and isinstance(rules_obj["rules"], dict):
-        # Convert to formatting_intent-like structure if present
-        out = {"formatting_intent": {"heading_rules": []}}
-        heading = rules_obj["rules"].get("heading") or []
-        for item in heading:
-            try:
-                lvl = int(item.get("level", 1))
-                detect = item.get("detect", "")
-                out["formatting_intent"]["heading_rules"].append(
-                    {"level": lvl, "detect": detect, "style_key": f"h{lvl}"}
-                )
-            except Exception:
-                continue
-        out["formatting_intent"]["body_style_key"] = "body"
-        # Optional sections:
-        for k in ["references_start", "figure_caption", "table_caption"]:
-            if k in rules_obj["rules"]:
-                out["formatting_intent"][k] = rules_obj["rules"][k]
+def normalize_rules(rules_obj: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Make rules robust even if missing fields."""
+    out = {
+        "formatting_intent": {
+            "body_style_name": None,
+            "heading_rules": [],
+            "special_rules": [],
+        },
+        "notes": "",
+    }
+    if not rules_obj:
         return out
 
-    return {}
+    fi = rules_obj.get("formatting_intent") or rules_obj.get("formattingIntent") or {}
+    out["formatting_intent"]["body_style_name"] = fi.get("body_style_name") or fi.get("bodyStyleName")
+    out["formatting_intent"]["heading_rules"] = fi.get("heading_rules") or fi.get("headingRules") or []
+    out["formatting_intent"]["special_rules"] = fi.get("special_rules") or fi.get("specialRules") or []
+    out["notes"] = rules_obj.get("notes") or ""
+    return out
 
-def build_matchers_from_rules(rules_obj: dict) -> List[Tuple[int, object]]:
-    """
-    Returns list of (level, compiled_detector) sorted by level desc (3->1)
-    """
-    intent = (rules_obj or {}).get("formatting_intent") or {}
-    heading_rules = intent.get("heading_rules") or []
-    matchers = []
+
+def build_matchers(rules: Dict[str, Any]):
+    fi = rules["formatting_intent"]
+    heading_rules = fi.get("heading_rules") or []
+    special_rules = fi.get("special_rules") or []
+
+    compiled_heading = []
     for r in heading_rules:
         try:
             level = int(r.get("level"))
+            detect = r.get("detect") or ""
+            style_name = r.get("style_name")
+            compiled_heading.append({
+                "level": level,
+                "detect_raw": detect,
+                "detect": compile_detect(detect),
+                "style_name": style_name,
+            })
         except Exception:
             continue
-        compiled = _compile_detect(r.get("detect", ""))
-        if compiled is None:
+
+    # Avoid "1." swallowing "1.1": check deeper levels first
+    compiled_heading.sort(key=lambda x: x["level"], reverse=True)
+
+    compiled_special = []
+    for r in special_rules:
+        try:
+            typ = r.get("type")
+            detect = r.get("detect") or ""
+            style_name = r.get("style_name")
+            compiled_special.append({
+                "type": typ,
+                "detect_raw": detect,
+                "detect": compile_detect(detect),
+                "style_name": style_name,
+            })
+        except Exception:
             continue
-        matchers.append((level, compiled))
-    # Prefer deeper levels first
-    matchers.sort(key=lambda x: x[0], reverse=True)
-    return matchers
+
+    return compiled_special, compiled_heading
 
 
-# -------------------------
-# MVP Heuristics (no LLM)
-# -------------------------
+# -----------------------------
+# Apply formatting
+# -----------------------------
+def decide_style_for_paragraph(
+    text: str,
+    compiled_special: List[Dict[str, Any]],
+    compiled_heading: List[Dict[str, Any]],
+    template_styles: set,
+    body_style: str,
+) -> str:
+    t = (text or "").strip()
 
-RX_H1 = re.compile(r"^(第[一二三四五六七八九十]+章)\b|^\d+\s*[\.、]\s+\S")
-RX_H2 = re.compile(r"^\d+\.\d+\s+\S")
-RX_H3 = re.compile(r"^\d+\.\d+\.\d+\s+\S")
+    # Empty paragraph: keep body
+    if not t:
+        return body_style
 
-RX_REF_TITLE = re.compile(r"^(参考文献|REFERENCES)\b", re.IGNORECASE)
-RX_FIG_CAP = re.compile(r"^图\s*\d+|^Figure\s*\d+", re.IGNORECASE)
-RX_TAB_CAP = re.compile(r"^表\s*\d+|^Table\s*\d+", re.IGNORECASE)
+    # Special rules first
+    for r in compiled_special:
+        if match_detect(r["detect"], t):
+            return pick_existing_style(r.get("style_name"), template_styles, [body_style, "Normal"])
+
+    # Heading rules
+    for r in compiled_heading:
+        if match_detect(r["detect"], t):
+            # If the rule provides a style_name, use it; else fallback by level
+            provided = r.get("style_name")
+            if provided and provided in template_styles:
+                return provided
+            if r["level"] == 1:
+                return pick_existing_style(None, template_styles, ["Heading 1", "标题 1", "标题1", "Title", body_style, "Normal"])
+            if r["level"] == 2:
+                return pick_existing_style(None, template_styles, ["Heading 2", "标题 2", "标题2", body_style, "Normal"])
+            if r["level"] == 3:
+                return pick_existing_style(None, template_styles, ["Heading 3", "标题 3", "标题3", body_style, "Normal"])
+            return body_style
+
+    return body_style
 
 
-# -------------------------
-# Template style mapping
-# -------------------------
-
-def get_template_style_ids(template_doc: Document) -> Dict[str, Optional[str]]:
+def copy_table_into_doc(target_doc: Document, table: Table):
     """
-    Returns style_id map by semantic keys.
-    Prefer CM* styles if present, else fall back to default Word names.
+    Best-effort table preservation: deep-copy table XML into target doc body.
     """
-    return {
-        "body": pick_style_id(template_doc, ["CMcontent", "Normal", "Body Text"]),
-        "h1": pick_style_id(template_doc, ["CMheading1", "Heading 1", "标题 1", "标题1", "一级标题"]),
-        "h2": pick_style_id(template_doc, ["CMheading2", "Heading 2", "标题 2", "标题2", "二级标题"]),
-        "h3": pick_style_id(template_doc, ["CMheading3", "Heading 3", "标题 3", "标题3", "三级标题"]),
-        "fig_caption": pick_style_id(template_doc, ["CMcaption", "Caption"]),
-        "tab_caption": pick_style_id(template_doc, ["CMcaptionTable", "Caption"]),
-        "ref_item": pick_style_id(template_doc, ["CMreflist", "Bibliography", "References"]),
-    }
+    tbl = table._tbl
+    target_doc.element.body.append(deepcopy(tbl))
 
 
-# -------------------------
-# Apply styles (content unchanged)
-# -------------------------
-
-def apply_styles_in_place(
+def rebuild_doc_with_styles(
     template_doc: Document,
     source_doc: Document,
-    rules_obj: Optional[dict] = None
-) -> None:
-    style_ids = get_template_style_ids(template_doc)
+    rules_obj: Optional[Dict[str, Any]],
+) -> Document:
+    # Prepare template as output base
+    out_doc = template_doc
+    template_styles = get_style_names(out_doc)
+    clear_document_body(out_doc)
 
-    normalized = normalize_rules(rules_obj or {})
-    matchers = build_matchers_from_rules(normalized)
+    rules = normalize_rules(rules_obj)
+    compiled_special, compiled_heading = build_matchers(rules)
 
-    # Optional section detectors from rules (if provided)
-    intent = (normalized or {}).get("formatting_intent") or {}
-    ref_start_det = _compile_detect(intent.get("references_start")) if intent.get("references_start") else None
-    fig_cap_det = _compile_detect(intent.get("figure_caption")) if intent.get("figure_caption") else None
-    tab_cap_det = _compile_detect(intent.get("table_caption")) if intent.get("table_caption") else None
+    body_style = pick_existing_style(
+        rules["formatting_intent"].get("body_style_name"),
+        template_styles,
+        ["正文", "Normal", "Body Text"]
+    )
 
-    in_references = False
+    for block in iter_block_items(source_doc):
+        if isinstance(block, Paragraph):
+            text = block.text or ""
 
-    for p in iter_all_paragraphs(source_doc):
-        text = (p.text or "").strip()
-        if not text:
-            continue
+            style_to_apply = decide_style_for_paragraph(
+                text=text,
+                compiled_special=compiled_special,
+                compiled_heading=compiled_heading,
+                template_styles=template_styles,
+                body_style=body_style,
+            )
 
-        # Detect references section start
-        if ref_start_det and _match(ref_start_det, text):
-            in_references = True
-            # Title line itself can be treated as H1 if available
-            if style_ids.get("h1"):
-                set_paragraph_style_id(p, style_ids["h1"])
-            continue
-        elif (not ref_start_det) and RX_REF_TITLE.search(text):
-            in_references = True
-            if style_ids.get("h1"):
-                set_paragraph_style_id(p, style_ids["h1"])
-            continue
+            # Create paragraph and copy plain text (MVP: keep text identical; inline run formats are not preserved)
+            p = out_doc.add_paragraph(text)
+            try:
+                p.style = style_to_apply
+            except Exception:
+                # If style missing or invalid, fallback
+                try:
+                    p.style = body_style
+                except Exception:
+                    pass
 
-        # If we're in references section, style all subsequent paragraphs as reference items (if style exists)
-        if in_references and style_ids.get("ref_item"):
-            set_paragraph_style_id(p, style_ids["ref_item"])
-            continue
+        elif isinstance(block, Table):
+            copy_table_into_doc(out_doc, block)
 
-        # Captions (optional rule-based, else heuristic)
-        if style_ids.get("fig_caption"):
-            if (fig_cap_det and _match(fig_cap_det, text)) or ((not fig_cap_det) and RX_FIG_CAP.search(text)):
-                set_paragraph_style_id(p, style_ids["fig_caption"])
-                continue
-
-        if style_ids.get("tab_caption"):
-            if (tab_cap_det and _match(tab_cap_det, text)) or ((not tab_cap_det) and RX_TAB_CAP.search(text)):
-                set_paragraph_style_id(p, style_ids["tab_caption"])
-                continue
-
-        # Headings (rule-based first, else heuristic)
-        applied = False
-        if matchers:
-            # Rule-based levels: choose the first match (levels are sorted desc)
-            for level, compiled in matchers:
-                if _match(compiled, text):
-                    key = f"h{level}"
-                    if style_ids.get(key):
-                        set_paragraph_style_id(p, style_ids[key])
-                        applied = True
-                    break
-
-        if not applied:
-            # MVP heuristic
-            if style_ids.get("h3") and RX_H3.search(text):
-                set_paragraph_style_id(p, style_ids["h3"])
-            elif style_ids.get("h2") and RX_H2.search(text):
-                set_paragraph_style_id(p, style_ids["h2"])
-            elif style_ids.get("h1") and RX_H1.search(text):
-                set_paragraph_style_id(p, style_ids["h1"])
-            else:
-                # Default body
-                if style_ids.get("body"):
-                    set_paragraph_style_id(p, style_ids["body"])
+    return out_doc
 
 
-# -------------------------
-# Insert source into template
-# -------------------------
-
-def find_placeholder_paragraph(doc: Document, placeholder: str = PLACEHOLDER) -> Optional[Paragraph]:
-    for p in doc.paragraphs:
-        if (p.text or "").strip() == placeholder:
-            return p
-    return None
-
-def insert_doc_body_after_paragraph(anchor_p: Paragraph, src_doc: Document) -> None:
-    """
-    Deep-copy src_doc body elements (paragraphs, tables, pictures) after anchor.
-    Skip sectPr to avoid section property conflicts.
-    """
-    anchor_elm = anchor_p._p
-    parent = anchor_elm.getparent()
-    idx = parent.index(anchor_elm)
-
-    for child in src_doc.element.body.iterchildren():
-        if child.tag.endswith("}sectPr"):
-            continue
-        parent.insert(idx + 1, deepcopy(child))
-        idx += 1
-
-
-# -------------------------
-# Endpoints
-# -------------------------
-
+# -----------------------------
+# API
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/format")
 async def format_docx(
     template: UploadFile = File(...),
     source: UploadFile = File(...),
-    rules: str = Form(None),            # Optional JSON rules from LLM
-    x_api_key: str = Header(None),      # Optional auth header
+    rules: Optional[str] = Form(None),
+    x_api_key: Optional[str] = Header(None, convert_underscores=False),
 ):
-    # Optional API key auth
-    api_key = os.getenv("API_KEY")
-    if api_key and x_api_key != api_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    # Optional auth
+    if API_KEY:
+        if not x_api_key or x_api_key.strip() != API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
-    t_bytes = await template.read()
-    s_bytes = await source.read()
+    # Basic validation
+    if not template.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="template must be .docx")
+    if not source.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="source must be .docx")
 
-    tdoc = Document(io.BytesIO(t_bytes))
-    sdoc = Document(io.BytesIO(s_bytes))
+    template_bytes = await template.read()
+    source_bytes = await source.read()
 
-    rules_obj = {}
+    try:
+        template_doc = Document(io.BytesIO(template_bytes))
+        source_doc = Document(io.BytesIO(source_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to open docx: {e}")
+
+    # Parse rules (supports double-json)
+    rules_obj = None
     if rules:
         try:
-            rules_obj = json.loads(rules)
-        except Exception:
-            rules_obj = {}
+            rules_obj = parse_rules(rules)
+        except Exception as e:
+            # If rules parsing fails, fall back to no-rules MVP (all body)
+            rules_obj = None
 
-    # 1) Apply template styles in-place on source (content unchanged)
-    apply_styles_in_place(tdoc, sdoc, rules_obj if rules_obj else None)
-
-    # 2) Find placeholder in template (or append)
-    anchor = find_placeholder_paragraph(tdoc, PLACEHOLDER)
-    if anchor is None:
-        # If no placeholder, append an empty paragraph at end as anchor
-        anchor = tdoc.add_paragraph("")
-
-    # If placeholder exists as text, clear it
+    # Build output doc
     try:
-        if (anchor.text or "").strip() == PLACEHOLDER:
-            anchor.text = ""
-    except Exception:
-        pass
+        out_doc = rebuild_doc_with_styles(template_doc, source_doc, rules_obj)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to format docx: {e}")
 
-    # 3) Insert the full styled source body (paragraphs/tables/images)
-    insert_doc_body_after_paragraph(anchor, sdoc)
+    buf = io.BytesIO()
+    out_doc.save(buf)
+    buf.seek(0)
 
-    # 4) Return output docx
-    out = io.BytesIO()
-    tdoc.save(out)
-    out.seek(0)
-
-    headers = {"Content-Disposition": 'attachment; filename="output.docx"'}
+    headers = {
+        "Content-Disposition": 'attachment; filename="result.docx"'
+    }
     return StreamingResponse(
-        out,
+        buf,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers=headers,
     )
