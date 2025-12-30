@@ -1,36 +1,36 @@
 import io
-import json
 import re
 from copy import deepcopy
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 from fastapi.responses import StreamingResponse
+
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, Cm
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
 from docx.text.paragraph import Paragraph
 from docx.table import Table
-
-# 用于按“文档真实顺序”遍历段落+表格
 from docx.oxml.text.paragraph import CT_P
 from docx.oxml.table import CT_Tbl
 
 
-app = FastAPI()
+app = FastAPI(title="docx-format-api", version="0.2.0")
 
-# 可选：简单鉴权（Render / Railway 环境变量里配）
-# 不想要鉴权就保持 None
-API_KEY = None  # 例如 "xxxx"
+# 可选：鉴权。需要就填一个字符串，并在 Dify HTTP 节点 Header 里传 X-API-Key
+API_KEY = None
 
 
-# --------------------------
-# Helpers
-# --------------------------
+# ---------------------------
+# Helpers: iterate blocks
+# ---------------------------
 def iter_block_items(doc: Document):
-    """
-    Yield Paragraph and Table objects in document order.
-    """
-    parent_elm = doc.element.body
-    for child in parent_elm.iterchildren():
+    body = doc.element.body
+    for child in body.iterchildren():
         if isinstance(child, CT_P):
             yield Paragraph(child, doc)
         elif isinstance(child, CT_Tbl):
@@ -38,18 +38,17 @@ def iter_block_items(doc: Document):
 
 
 def clear_body_keep_sectpr(doc: Document):
-    """
-    Remove all paragraphs & tables in body but keep section properties (sectPr).
-    This makes the output contain NO template content, while preserving page setup/styles.
-    """
+    """清空模板正文内容（不输出任何模板文字），保留页面/分节设置。"""
     body = doc._element.body
     for child in list(body):
-        # remove <w:p> and <w:tbl>, keep <w:sectPr>
         tag = child.tag.lower()
         if tag.endswith("}p") or tag.endswith("}tbl"):
             body.remove(child)
 
 
+# ---------------------------
+# Style creation (even if template is blank)
+# ---------------------------
 def style_exists(doc: Document, name: str) -> bool:
     try:
         _ = doc.styles[name]
@@ -58,207 +57,215 @@ def style_exists(doc: Document, name: str) -> bool:
         return False
 
 
-def pick_style(doc: Document, *candidates: Optional[str]) -> Optional[str]:
+def ensure_eastasia_font(style, font_name: str):
+    st = style._element
+    rPr = st.find(qn("w:rPr"))
+    if rPr is None:
+        rPr = OxmlElement("w:rPr")
+        st.append(rPr)
+
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+
+    rFonts.set(qn("w:eastAsia"), font_name)
+    rFonts.set(qn("w:ascii"), font_name)
+    rFonts.set(qn("w:hAnsi"), font_name)
+    style.font.name = font_name
+
+
+def ensure_paragraph_style(doc: Document, name: str):
+    if style_exists(doc, name):
+        return doc.styles[name]
+    return doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+
+
+def ensure_required_styles(doc: Document):
     """
-    Return first existing style name in doc.styles.
+    确保我们需要的样式都存在；模板没有也会创建。
+    这套参数就是你要的“通用论文排版 MVP”：
+    - 正文：宋体 小四 1.5 倍行距 首行缩进2字
+    - 标题1/2/3：黑体 三号/四号/小四，加粗（1居中）
+    - 题注：宋体 五号 居中
+    - 参考文献：宋体 五号 悬挂缩进 0.74cm
     """
-    for c in candidates:
-        if c and style_exists(doc, c):
-            return c
-    return None
+    # 正文
+    s = ensure_paragraph_style(doc, "CMcontent")
+    ensure_eastasia_font(s, "宋体")
+    s.font.size = Pt(12)
+    pf = s.paragraph_format
+    pf.first_line_indent = Cm(0.74)
+    pf.line_spacing = 1.5
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+    # 一级标题
+    s = ensure_paragraph_style(doc, "CMheading1")
+    ensure_eastasia_font(s, "黑体")
+    s.font.size = Pt(16)
+    s.font.bold = True
+    pf = s.paragraph_format
+    pf.first_line_indent = Cm(0)
+    pf.line_spacing = 1.2
+    pf.space_before = Pt(12)
+    pf.space_after = Pt(6)
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 二级标题
+    s = ensure_paragraph_style(doc, "CMheading2")
+    ensure_eastasia_font(s, "黑体")
+    s.font.size = Pt(14)
+    s.font.bold = True
+    pf = s.paragraph_format
+    pf.first_line_indent = Cm(0)
+    pf.line_spacing = 1.2
+    pf.space_before = Pt(6)
+    pf.space_after = Pt(3)
+    pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # 三级标题
+    s = ensure_paragraph_style(doc, "CMheading3")
+    ensure_eastasia_font(s, "黑体")
+    s.font.size = Pt(12)
+    s.font.bold = True
+    pf = s.paragraph_format
+    pf.first_line_indent = Cm(0)
+    pf.line_spacing = 1.2
+    pf.space_before = Pt(3)
+    pf.space_after = Pt(3)
+    pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # 图题注
+    s = ensure_paragraph_style(doc, "CMcaption")
+    ensure_eastasia_font(s, "宋体")
+    s.font.size = Pt(10.5)
+    pf = s.paragraph_format
+    pf.first_line_indent = Cm(0)
+    pf.line_spacing = 1.0
+    pf.space_before = Pt(6)
+    pf.space_after = Pt(6)
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 表题注
+    s = ensure_paragraph_style(doc, "CMcaptionTable")
+    ensure_eastasia_font(s, "宋体")
+    s.font.size = Pt(10.5)
+    pf = s.paragraph_format
+    pf.first_line_indent = Cm(0)
+    pf.line_spacing = 1.0
+    pf.space_before = Pt(6)
+    pf.space_after = Pt(6)
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 参考文献条目
+    s = ensure_paragraph_style(doc, "CMreflist")
+    ensure_eastasia_font(s, "宋体")
+    s.font.size = Pt(10.5)
+    pf = s.paragraph_format
+    pf.line_spacing = 1.15
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.left_indent = Cm(0.74)
+    pf.first_line_indent = Cm(-0.74)  # 悬挂缩进
 
 
-def parse_rules(rules_str: Optional[str]) -> Dict[str, Any]:
-    """
-    Accept:
-    - plain JSON dict
-    - JSON string that is itself a dict
-    - Dify LLM output wrapper like {"text": "{...json...}", ...}
-    """
-    if not rules_str:
-        return {}
+# ---------------------------
+# Classification rules (no LLM)
+# ---------------------------
+RE_H3 = re.compile(r"^\s*\d+\.\d+\.\d+\s+\S")
+RE_H2 = re.compile(r"^\s*\d+\.\d+\s+\S")
+RE_H1_NUM = re.compile(r"^\s*\d+\.\s+\S")
+RE_H1_CHAPTER = re.compile(r"^\s*第\s*[0-9一二三四五六七八九十]+\s*章\b")
 
-    # Some clients may send already-json-like strings with leading/trailing spaces
-    s = rules_str.strip()
-    if not s:
-        return {}
+RE_CAP_FIG = re.compile(r"^\s*(图|Figure)\s*\d+")
+RE_CAP_TBL = re.compile(r"^\s*(表|Table)\s*\d+")
 
-    def _loads_maybe(x: str):
-        return json.loads(x)
+RE_REF_ITEM = re.compile(r"^\s*(\[\d+\]|\d+\.)\s+")
 
-    try:
-        obj = _loads_maybe(s)
-    except Exception:
-        # not JSON, ignore
-        return {}
-
-    # If it is a JSON string that itself contains JSON dict
-    if isinstance(obj, str):
-        try:
-            obj2 = _loads_maybe(obj)
-            obj = obj2
-        except Exception:
-            return {}
-
-    # If it is Dify wrapper dict {"text": "..."}
-    if isinstance(obj, dict) and isinstance(obj.get("text"), str):
-        inner = obj["text"].strip()
-        # inner might itself be JSON dict string
-        try:
-            inner_obj = _loads_maybe(inner)
-            if isinstance(inner_obj, dict):
-                return inner_obj
-        except Exception:
-            # Sometimes the inner is a JSON string again
-            try:
-                inner_obj2 = _loads_maybe(_loads_maybe(inner))
-                if isinstance(inner_obj2, dict):
-                    return inner_obj2
-            except Exception:
-                pass
-        # fallback to wrapper dict
-        return obj
-
-    return obj if isinstance(obj, dict) else {}
+SECTION_KEYWORDS_AS_H1 = {"绪论", "引言", "相关工作", "实验", "讨论", "结论", "致谢", "参考文献", "附录"}
 
 
-def eval_detect(text: str, detect: str) -> bool:
-    """
-    detect formats:
-      - "regex:...."
-      - "contains:a|b|c"
-    """
-    if not detect:
+def is_short_heading_like(s: str) -> bool:
+    s2 = s.strip()
+    if len(s2) == 0:
         return False
-    d = detect.strip()
-    dl = d.lower()
-    if dl.startswith("regex:"):
-        pat = d[6:].strip()
-        try:
-            return re.search(pat, text) is not None
-        except re.error:
-            return False
-    if dl.startswith("contains:"):
-        parts = [p.strip() for p in d[len("contains:"):].split("|") if p.strip()]
-        return any(p in text for p in parts)
-    # fallback: treat as contains with "|" support
-    parts = [p.strip() for p in d.split("|") if p.strip()]
-    return any(p in text for p in parts)
+    # 太长一般不是“纯标题”
+    if len(s2) > 25:
+        return False
+    # 含明显句号/分号/逗号/冒号通常不是纯标题（可按需放松）
+    if any(ch in s2 for ch in ["。", "；", "，", "：", ":", ".", "、"]):
+        return False
+    return True
 
 
-def build_default_rules(template_doc: Document) -> Dict[str, Any]:
+def classify_paragraph(text: str, in_refs: bool) -> Tuple[str, bool]:
     """
-    Default MVP rules:
-    - heading1: 第X章 / 1. / 2. / 3. ...
-    - heading2: 1.1
-    - heading3: 1.1.1
-    - captions: 图/表
-    - special headings: 摘要/关键词/参考文献/致谢/附录
+    返回 (style_name, in_refs_next)
     """
-    body_style = pick_style(template_doc, "CMcontent", "正文", "Normal") or "Normal"
-    h1 = pick_style(template_doc, "CMheading1", "标题1", "Heading 1") or "Heading 1"
-    h2 = pick_style(template_doc, "CMheading2", "标题2", "Heading 2") or "Heading 2"
-    h3 = pick_style(template_doc, "CMheading3", "标题3", "Heading 3") or "Heading 3"
-    cap_fig = pick_style(template_doc, "CMcaption", "题注", "Caption") or body_style
-    cap_tbl = pick_style(template_doc, "CMcaptionTable", "题注", "Caption") or body_style
-    reflist = pick_style(template_doc, "CMreflist", "参考文献", "Normal") or body_style
-    appendix_h1 = pick_style(template_doc, "附录标题1", "CMheading1", "标题1", "Heading 1") or h1
+    t = (text or "").strip()
+    if t == "":
+        return "CMcontent", False
 
-    return {
-        "formatting_intent": {
-            "body_style_name": body_style,
-            "heading_rules": [
-                {"level": 1, "detect": r"regex:^(第[零一二三四五六七八九十\d]+章|\d+\.)\s*", "style_name": h1},
-                {"level": 2, "detect": r"regex:^\d+\.\d+\s*", "style_name": h2},
-                {"level": 3, "detect": r"regex:^\d+\.\d+\.\d+\s*", "style_name": h3},
-            ],
-            "special_rules": [
-                {"type": "abstract", "detect": "contains:摘要|摘 要|ABSTRACT", "style_name": h1},
-                {"type": "keywords", "detect": "contains:关键词|Key words|Keywords", "style_name": body_style},
-                {"type": "references", "detect": "contains:参考文献|References", "style_name": h1},
-                {"type": "acknowledgement", "detect": "contains:致谢|Acknowledgement", "style_name": h1},
-                {"type": "caption_figure", "detect": r"regex:^(图|Figure)\s*\d+", "style_name": cap_fig},
-                {"type": "caption_table", "detect": r"regex:^(表|Table)\s*\d+", "style_name": cap_tbl},
-                {"type": "appendix", "detect": r"regex:^附录\s*[A-Z]", "style_name": appendix_h1},
-            ],
-            "reference_list_style_name": reflist,
-        }
-    }
-
-
-def classify_paragraph(
-    text: str,
-    rules: Dict[str, Any],
-    in_references: bool
-) -> Tuple[str, bool]:
-    """
-    Return (style_name, in_references_next)
-    """
-    intent = (rules or {}).get("formatting_intent") or {}
-    body_style = intent.get("body_style_name") or "Normal"
-    heading_rules = intent.get("heading_rules") or []
-    special_rules = intent.get("special_rules") or []
-    reflist_style = intent.get("reference_list_style_name") or body_style
-
-    t = text or ""
-    ts = t.strip()
-
-    # Blank lines: keep as body style, and if we were in references, we can stop references on first blank
-    if ts == "":
-        return body_style, False if in_references else False
-
-    # If already in references: apply reference list style when looks like a reference line
-    if in_references:
-        # common patterns: [1] ...  or  1. ...
-        if re.match(r"^\[\d+\]\s*", ts) or re.match(r"^\d+\.\s+", ts):
-            return reflist_style, True
-        # if a new big section starts, stop references
-        if re.match(r"^(附录|致谢|第[零一二三四五六七八九十\d]+章|\d+\.)", ts):
-            # fall through to normal detection below
-            in_references = False
+    # 参考文献段落区：遇到“参考文献”后，条目套 CMreflist，直到碰到新章节/空行
+    if in_refs:
+        if RE_REF_ITEM.match(t):
+            return "CMreflist", True
+        # 碰到新章节/附录/致谢等，退出 references
+        if RE_H1_CHAPTER.match(t) or RE_H1_NUM.match(t) or t in SECTION_KEYWORDS_AS_H1 or t.startswith("附录"):
+            in_refs = False
         else:
-            # otherwise still treat as reference paragraph
-            return reflist_style, True
+            # 仍当作参考文献条目（容错）
+            return "CMreflist", True
 
-    # 1) Special rules first
-    for r in special_rules:
-        detect = r.get("detect") or ""
-        style_name = r.get("style_name") or body_style
-        rtype = (r.get("type") or "").lower()
+    # 特殊块：参考文献/致谢/附录/摘要/关键词等（标题行短）
+    if ("参考文献" in t) and is_short_heading_like(t):
+        return "CMheading1", True  # 进入 references 区
+    if ("致谢" in t or "Acknowledgement" in t) and is_short_heading_like(t):
+        return "CMheading1", False
+    if (t.startswith("附录") and is_short_heading_like(t)):
+        return "CMheading1", False
 
-        if eval_detect(ts, detect):
-            # entering references section
-            if rtype == "references":
-                return style_name, True
-            return style_name, False
+    # 摘要/关键词标题（短）
+    if (("摘要" in t or "摘 要" in t or t.upper() == "ABSTRACT") and is_short_heading_like(t)):
+        return "CMheading1", False
+    if (("关键词" in t or "关键字" in t or "Keywords" in t or "Key words" in t) and is_short_heading_like(t)):
+        return "CMheading1", False
 
-    # 2) Heading rules
-    for r in heading_rules:
-        detect = r.get("detect") or ""
-        style_name = r.get("style_name") or body_style
-        if eval_detect(ts, detect):
-            return style_name, False
+    # 题注
+    if RE_CAP_FIG.match(t):
+        return "CMcaption", False
+    if RE_CAP_TBL.match(t):
+        return "CMcaptionTable", False
 
-    # 3) Fallback
-    return body_style, False
+    # 标题层级（先 3 再 2 再 1，避免 1. 吃掉 1.1）
+    if RE_H3.match(t):
+        return "CMheading3", False
+    if RE_H2.match(t):
+        return "CMheading2", False
+    if RE_H1_CHAPTER.match(t) or RE_H1_NUM.match(t):
+        return "CMheading1", False
+
+    # 无编号但很像标题（比如“讨论”“结论”）
+    if t in SECTION_KEYWORDS_AS_H1:
+        return "CMheading1", False
+
+    return "CMcontent", False
 
 
-def copy_paragraph_runs(src_p: Paragraph, dst_p: Paragraph):
-    """
-    Copy runs text exactly, without carrying over manual formatting.
-    (Styles control formatting in output.)
-    """
-    if src_p.runs:
-        for r in src_p.runs:
-            dst_p.add_run(r.text)
+def copy_paragraph_text(src: Paragraph, dst: Paragraph):
+    """只复制文本，不带原手工格式（格式由样式统一控制）。"""
+    if src.runs:
+        for run in src.runs:
+            dst.add_run(run.text)
     else:
-        # keep exact paragraph text
-        dst_p.add_run(src_p.text)
+        dst.add_run(src.text)
 
 
-# --------------------------
+# ---------------------------
 # API
-# --------------------------
+# ---------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -268,66 +275,60 @@ def health():
 async def format_docx(
     template: UploadFile = File(...),
     source: UploadFile = File(...),
-    rules: Optional[str] = Form(None),
     x_api_key: Optional[str] = Header(None),
 ):
     if API_KEY is not None and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    if not template.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="template must be .docx")
+    if not source.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="source must be .docx")
+
     template_bytes = await template.read()
     source_bytes = await source.read()
 
     try:
-        template_doc = Document(io.BytesIO(template_bytes))
+        out_doc = Document(io.BytesIO(template_bytes))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid template docx: {e}")
 
     try:
-        source_doc = Document(io.BytesIO(source_bytes))
+        src_doc = Document(io.BytesIO(source_bytes))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid source docx: {e}")
 
-    # Parse rules; if not provided, use defaults
-    parsed_rules = parse_rules(rules)
-    if not parsed_rules or "formatting_intent" not in parsed_rules:
-        parsed_rules = build_default_rules(template_doc)
+    # 确保样式一定存在（模板没有也会创建）
+    ensure_required_styles(out_doc)
 
-    # Output doc: start from template, BUT remove all template body content
-    out_doc = template_doc
+    # 清空模板正文，只输出源内容
     clear_body_keep_sectpr(out_doc)
 
-    # Rebuild with ONLY source content formatted
+    # 重建：按固定规则给 source 套样式
     in_refs = False
-    for block in iter_block_items(source_doc):
+    for block in iter_block_items(src_doc):
         if isinstance(block, Paragraph):
-            src_p: Paragraph = block
-            text = src_p.text  # used for classification only
-            style_name, in_refs = classify_paragraph(text, parsed_rules, in_refs)
-
-            dst_p = out_doc.add_paragraph()
-            # set style if exists; otherwise keep default
-            if style_name and style_exists(out_doc, style_name):
-                dst_p.style = style_name
-            copy_paragraph_runs(src_p, dst_p)
+            style_name, in_refs = classify_paragraph(block.text, in_refs)
+            p = out_doc.add_paragraph()
+            if style_exists(out_doc, style_name):
+                p.style = style_name
+            copy_paragraph_text(block, p)
 
         elif isinstance(block, Table):
-            # Deep copy table XML into output (keeps table content)
+            # 表格直接拷贝（保留内容）
             out_doc._element.body.append(deepcopy(block._element))
 
-    # If any placeholder accidentally exists in output (e.g. source includes it), remove it
-    # (Optional safety)
+    # 防止源文档里意外带了占位符
     for p in list(out_doc.paragraphs):
         if p.text.strip() == "{{CONTENT}}":
-            # remove this paragraph element
             p._element.getparent().remove(p._element)
 
     buf = io.BytesIO()
     out_doc.save(buf)
     buf.seek(0)
 
-    filename = "formatted.docx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": 'attachment; filename="formatted.docx"'},
     )
